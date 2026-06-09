@@ -144,6 +144,15 @@ function parseArgs(argv) {
   return opts;
 }
 
+function stopInteractiveShell(stdin, stdout, stream) {
+  stdin.unpipe(stream);
+  stream.unpipe(stdout);
+  stdin.pause();
+  if (stdin.isTTY) {
+    stdin.setRawMode(false);
+  }
+}
+
 async function runInteractiveShell(ssh, stream) {
   const stdin = process.stdin;
   const stdout = process.stdout;
@@ -157,14 +166,14 @@ async function runInteractiveShell(ssh, stream) {
   stdin.pipe(stream);
 
   await new Promise((resolve, reject) => {
-    stream.on('close', resolve);
-    stream.on('error', reject);
-    ssh.on('close', resolve);
+    const done = () => {
+      stopInteractiveShell(stdin, stdout, stream);
+      resolve();
+    };
+    stream.once('close', done);
+    stream.once('exit', done);
+    stream.once('error', reject);
   });
-
-  if (stdin.isTTY) {
-    stdin.setRawMode(false);
-  }
 }
 
 async function main() {
@@ -183,6 +192,7 @@ async function main() {
   }
 
   let tunnel;
+  let ssh;
   try {
     console.error(`Opening tunnel to ${opts.thingName}…`);
     tunnel = await openSecureTunnel({
@@ -194,42 +204,39 @@ async function main() {
       `Tunnel ${tunnel.tunnelId} ready (${tunnel.region}). Starting SSH as ${opts.user}…`,
     );
 
-    const ssh = new Client();
-    const closed = new Promise((resolve) => ssh.once('close', resolve));
+    ssh = new Client();
 
     ssh.on('error', (err) => {
       console.error(`SSH error: ${err.message}`);
     });
 
     await new Promise((resolve, reject) => {
-      ssh.on('ready', async () => {
-        try {
-          ssh.shell({ term: process.env.TERM || 'xterm-256color' }, async (err, stream) => {
-            if (err) {
-              reject(err);
-              return;
-            }
-            console.error('Connected. Press Ctrl+D or exit to close.\n');
+      ssh.on('ready', () => {
+        ssh.shell({ term: process.env.TERM || 'xterm-256color' }, async (err, stream) => {
+          if (err) {
+            reject(err);
+            return;
+          }
+          console.error('Connected. Press Ctrl+D or exit to close.\n');
+          try {
             await runInteractiveShell(ssh, stream);
-            ssh.end();
-            resolve();
-          });
-        } catch (e) {
-          reject(e);
-        }
+          } catch (e) {
+            reject(e);
+            return;
+          }
+          resolve();
+        });
       });
 
       ssh.connect(buildSshConnectOptions(opts, tunnel.stream));
     });
-
-    await closed;
   } catch (err) {
     console.error(`Failed: ${err.message}`);
     process.exitCode = 1;
   } finally {
     if (tunnel) {
       console.error('Closing tunnel…');
-      await tunnel.close();
+      await tunnel.close({ ssh });
     }
   }
 }
