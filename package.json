@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "SSH to an IoT edge device via AWS IoT Secure Tunneling without localproxy/Docker",
   "bin": {
-    "iotssh": "./index.js"
+    "iotssh": "index.js"
   },
   "files": [
     "index.js",
