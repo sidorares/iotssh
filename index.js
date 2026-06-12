@@ -65,10 +65,21 @@ function buildSshConnectOptions(opts, sock) {
   return config;
 }
 
-function usage() {
-  console.error(`Usage: iotssh <THING_NAME> [options]
+function ptySettings() {
+  return {
+    term: process.env.TERM || 'xterm-256color',
+    rows: process.stdout.rows || 24,
+    cols: process.stdout.columns || 80,
+  };
+}
 
-Connect to an IoT edge device shell via AWS IoT Secure Tunneling (no Docker/localproxy).
+function usage() {
+  console.error(`Usage: iotssh <THING_NAME> [options] [--] [command]
+
+Connect to an IoT edge device via AWS IoT Secure Tunneling (no Docker/localproxy).
+
+With no command, opens an interactive shell (or pipes stdin to the remote shell when
+stdin is not a TTY, like "ssh host < script.sh").
 
 Options:
   --user <name>       SSH user (default: ${DEFAULT_USER})
@@ -78,6 +89,7 @@ Options:
   --try-keyboard      Answer keyboard-interactive prompts with --password
   --region <region>   AWS region (default: AWS_REGION or ~/.aws/config via SDK)
   --wait <seconds>    Wait for destination proxy after open-tunnel (default: 4)
+  -t, --force-tty     Force pseudo-TTY allocation for remote commands (like ssh -t)
   -h, --help          Show this help
 
 Environment:
@@ -86,9 +98,11 @@ Environment:
   IOTSSH_KEY_PATH     Path to SSH private key
   IOTSSH_USE_AGENT    Set to 1 to use ssh-agent
 
-Example:
+Examples:
   iotssh my-edge-device
-  npx iotssh my-edge-device --user root
+  iotssh my-edge-device "hostname"
+  iotssh -t my-edge-device "top"
+  iotssh my-edge-device < deploy.sh
 `);
 }
 
@@ -96,6 +110,7 @@ function parseArgs(argv) {
   const args = argv.slice(2);
   const opts = {
     thingName: null,
+    command: undefined,
     user: DEFAULT_USER,
     region: process.env.AWS_REGION,
     waitSec: 4,
@@ -103,6 +118,7 @@ function parseArgs(argv) {
     privateKey: undefined,
     useAgent: false,
     tryKeyboard: false,
+    forceTTY: false,
   };
 
   if (process.env.IOTSSH_PASSWORD !== undefined) {
@@ -119,6 +135,8 @@ function parseArgs(argv) {
     const a = args[i];
     if (a === '-h' || a === '--help') {
       opts.help = true;
+    } else if (a === '-t' || a === '--force-tty') {
+      opts.forceTTY = true;
     } else if (a === '--user') {
       opts.user = args[++i];
     } else if (a === '--password') {
@@ -134,8 +152,18 @@ function parseArgs(argv) {
       opts.region = args[++i];
     } else if (a === '--wait') {
       opts.waitSec = Number(args[++i]);
-    } else if (!a.startsWith('-') && !opts.thingName) {
-      opts.thingName = a;
+    } else if (a === '--') {
+      opts.command = args.slice(i + 1).join(' ');
+      break;
+    } else if (!a.startsWith('-')) {
+      if (!opts.thingName) {
+        opts.thingName = a;
+      } else if (opts.command === undefined) {
+        opts.command = args.slice(i).join(' ');
+        break;
+      } else {
+        throw new Error(`Unexpected argument: ${a}`);
+      }
     } else {
       throw new Error(`Unknown argument: ${a}`);
     }
@@ -144,16 +172,65 @@ function parseArgs(argv) {
   return opts;
 }
 
-function stopInteractiveShell(stdin, stdout, stream) {
+/** @returns {'exec' | 'exec-tty' | 'shell-tty' | 'shell-pipe'} */
+function resolveSessionMode(opts) {
+  if (opts.command) {
+    const usePty = opts.forceTTY
+      || (process.stdin.isTTY && process.stdout.isTTY);
+    return usePty ? 'exec-tty' : 'exec';
+  }
+  if (process.stdin.isTTY) {
+    return 'shell-tty';
+  }
+  return 'shell-pipe';
+}
+
+function stopPipedSession(stdin, stdout, stream) {
   stdin.unpipe(stream);
   stream.unpipe(stdout);
   stdin.pause();
+}
+
+function stopInteractiveShell(stdin, stdout, stream) {
+  stopPipedSession(stdin, stdout, stream);
   if (stdin.isTTY) {
     stdin.setRawMode(false);
   }
 }
 
-async function runInteractiveShell(ssh, stream) {
+/**
+ * @param {import('ssh2').ClientChannel} stream
+ * @returns {Promise<{ exitCode: number }>}
+ */
+function waitForStreamClose(stream, onStop) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      onStop();
+      resolve({ exitCode: code ?? 0 });
+    };
+    stream.once('close', (code) => done(code));
+    stream.once('exit', (code) => done(code));
+    stream.once('error', (err) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      onStop();
+      reject(err);
+    });
+  });
+}
+
+/**
+ * @param {import('ssh2').ClientChannel} stream
+ * @returns {Promise<{ exitCode: number }>}
+ */
+async function runInteractiveStream(stream) {
   const stdin = process.stdin;
   const stdout = process.stdout;
 
@@ -165,15 +242,107 @@ async function runInteractiveShell(ssh, stream) {
   stream.pipe(stdout);
   stdin.pipe(stream);
 
-  await new Promise((resolve, reject) => {
-    const done = () => {
-      stopInteractiveShell(stdin, stdout, stream);
-      resolve();
-    };
-    stream.once('close', done);
-    stream.once('exit', done);
-    stream.once('error', reject);
+  return waitForStreamClose(stream, () => {
+    stopInteractiveShell(stdin, stdout, stream);
   });
+}
+
+/**
+ * @param {import('ssh2').Client} ssh
+ * @param {string} command
+ * @param {{ pty: boolean }} options
+ * @returns {Promise<{ exitCode: number }>}
+ */
+function runRemoteExec(ssh, command, { pty }) {
+  const execOpts = pty ? { pty: ptySettings() } : {};
+  return new Promise((resolve, reject) => {
+    ssh.exec(command, execOpts, async (err, stream) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      try {
+        if (pty) {
+          resolve(await runInteractiveStream(stream));
+          return;
+        }
+        const stdout = process.stdout;
+        stream.pipe(stdout);
+        stream.stderr.pipe(stdout);
+        resolve(await waitForStreamClose(stream, () => {
+          stream.unpipe(stdout);
+          stream.stderr.unpipe(stdout);
+        }));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+/**
+ * @param {import('ssh2').Client} ssh
+ * @returns {Promise<{ exitCode: number }>}
+ */
+function runPipedShell(ssh) {
+  return new Promise((resolve, reject) => {
+    ssh.shell(false, async (err, stream) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      const stdin = process.stdin;
+      const stdout = process.stdout;
+      stdin.resume();
+      stream.pipe(stdout);
+      stdin.pipe(stream);
+      try {
+        resolve(await waitForStreamClose(stream, () => {
+          stopPipedSession(stdin, stdout, stream);
+        }));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+/**
+ * @param {import('ssh2').Client} ssh
+ * @returns {Promise<{ exitCode: number }>}
+ */
+function runInteractiveShell(ssh) {
+  return new Promise((resolve, reject) => {
+    ssh.shell(ptySettings(), async (err, stream) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      try {
+        resolve(await runInteractiveStream(stream));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+/**
+ * @param {import('ssh2').Client} ssh
+ * @param {ReturnType<typeof parseArgs>} opts
+ * @returns {Promise<{ exitCode: number }>}
+ */
+async function runSshSession(ssh, opts) {
+  const mode = resolveSessionMode(opts);
+  switch (mode) {
+    case 'exec':
+      return runRemoteExec(ssh, opts.command, { pty: false });
+    case 'exec-tty':
+      return runRemoteExec(ssh, opts.command, { pty: true });
+    case 'shell-pipe':
+      return runPipedShell(ssh);
+  }
+  return runInteractiveShell(ssh);
 }
 
 async function main() {
@@ -190,6 +359,8 @@ async function main() {
     usage();
     process.exit(opts.help ? 0 : 2);
   }
+
+  const sessionMode = resolveSessionMode(opts);
 
   let tunnel;
   let ssh;
@@ -210,26 +381,22 @@ async function main() {
       console.error(`SSH error: ${err.message}`);
     });
 
-    await new Promise((resolve, reject) => {
-      ssh.on('ready', () => {
-        ssh.shell({ term: process.env.TERM || 'xterm-256color' }, async (err, stream) => {
-          if (err) {
-            reject(err);
-            return;
-          }
+    const { exitCode } = await new Promise((resolve, reject) => {
+      ssh.on('ready', async () => {
+        if (sessionMode === 'shell-tty') {
           console.error('Connected. Press Ctrl+D or exit to close.\n');
-          try {
-            await runInteractiveShell(ssh, stream);
-          } catch (e) {
-            reject(e);
-            return;
-          }
-          resolve();
-        });
+        }
+        try {
+          resolve(await runSshSession(ssh, opts));
+        } catch (e) {
+          reject(e);
+        }
       });
 
       ssh.connect(buildSshConnectOptions(opts, tunnel.stream));
     });
+
+    process.exitCode = exitCode;
   } catch (err) {
     console.error(`Failed: ${err.message}`);
     process.exitCode = 1;
