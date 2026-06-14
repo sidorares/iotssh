@@ -175,9 +175,7 @@ function parseArgs(argv) {
 /** @returns {'exec' | 'exec-tty' | 'shell-tty' | 'shell-pipe'} */
 function resolveSessionMode(opts) {
   if (opts.command) {
-    const usePty = opts.forceTTY
-      || (process.stdin.isTTY && process.stdout.isTTY);
-    return usePty ? 'exec-tty' : 'exec';
+    return opts.forceTTY ? 'exec-tty' : 'exec';
   }
   if (process.stdin.isTTY) {
     return 'shell-tty';
@@ -199,30 +197,29 @@ function stopInteractiveShell(stdin, stdout, stream) {
 }
 
 /**
+ * Wait until the channel is fully closed so piped stdout/stderr can drain.
+ * Do not settle on `exit` — the remote process may exit before all output arrives.
+ *
  * @param {import('ssh2').ClientChannel} stream
  * @returns {Promise<{ exitCode: number }>}
  */
 function waitForStreamClose(stream, onStop) {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const done = (code) => {
+    const finish = (code, err) => {
       if (settled) {
         return;
       }
       settled = true;
       onStop();
+      if (err) {
+        reject(err);
+        return;
+      }
       resolve({ exitCode: code ?? 0 });
     };
-    stream.once('close', (code) => done(code));
-    stream.once('exit', (code) => done(code));
-    stream.once('error', (err) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      onStop();
-      reject(err);
-    });
+    stream.once('close', (code) => finish(code));
+    stream.once('error', (err) => finish(undefined, err));
   });
 }
 
@@ -256,26 +253,22 @@ async function runInteractiveStream(stream) {
 function runRemoteExec(ssh, command, { pty }) {
   const execOpts = pty ? { pty: ptySettings() } : {};
   return new Promise((resolve, reject) => {
-    ssh.exec(command, execOpts, async (err, stream) => {
+    ssh.exec(command, execOpts, (err, stream) => {
       if (err) {
         reject(err);
         return;
       }
-      try {
-        if (pty) {
-          resolve(await runInteractiveStream(stream));
-          return;
-        }
-        const stdout = process.stdout;
-        stream.pipe(stdout);
-        stream.stderr.pipe(stdout);
-        resolve(await waitForStreamClose(stream, () => {
-          stream.unpipe(stdout);
-          stream.stderr.unpipe(stdout);
-        }));
-      } catch (e) {
-        reject(e);
+      if (pty) {
+        runInteractiveStream(stream).then(resolve, reject);
+        return;
       }
+      const stdout = process.stdout;
+      stream.pipe(stdout, { end: false });
+      stream.stderr.pipe(stdout, { end: false });
+      waitForStreamClose(stream, () => {
+        stream.unpipe(stdout);
+        stream.stderr.unpipe(stdout);
+      }).then(resolve, reject);
     });
   });
 }
