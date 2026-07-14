@@ -59,6 +59,10 @@ iotssh my-edge-device
 
 # or
 iotssh my-edge-device --password 'your-password'
+
+# file transfer (SFTP)
+iotssh put my-edge-device ./app.bin /tmp/app.bin
+iotssh get my-edge-device /var/log/app.log ./app.log
 ```
 
 Without a global install, use `npx` — it runs the same `iotssh` bin entry as a local install:
@@ -82,6 +86,10 @@ The client only enables methods you configure:
 | Keyboard-interactive | `--try-keyboard` (uses the same password for prompts) |
 
 If none are set, `ssh2` may still try keys from your ssh-agent. Host key algorithms include legacy `ssh-rsa` for embedded SSH servers such as Dropbear.
+
+### File transfer
+
+`put` and `get` open the same Secure Tunnel + SSH session, then use the SFTP subsystem (`ssh2` `fastPut` / `fastGet`). The device SSH server must support SFTP (OpenSSH does by default; some Dropbear builds do not).
 
 ## Protocol note
 
