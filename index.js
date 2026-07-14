@@ -74,12 +74,17 @@ function ptySettings() {
 }
 
 function usage() {
-  console.error(`Usage: iotssh <THING_NAME> [options] [--] [command]
+  console.error(`Usage:
+  iotssh <THING_NAME> [options] [--] [command]
+  iotssh put <THING_NAME> <local> <remote> [options]
+  iotssh get <THING_NAME> <remote> <local> [options]
 
 Connect to an IoT edge device via AWS IoT Secure Tunneling (no Docker/localproxy).
 
 With no command, opens an interactive shell (or pipes stdin to the remote shell when
 stdin is not a TTY, like "ssh host < script.sh").
+
+put / get transfer a single file over SFTP (requires SFTP on the device SSH server).
 
 Options:
   --user <name>       SSH user (default: ${DEFAULT_USER})
@@ -103,13 +108,36 @@ Examples:
   iotssh my-edge-device "hostname"
   iotssh -t my-edge-device "top"
   iotssh my-edge-device < deploy.sh
+  iotssh put my-edge-device ./app.bin /tmp/app.bin
+  iotssh get my-edge-device /var/log/app.log ./app.log
 `);
 }
 
+/**
+ * @returns {{
+ *   help?: boolean,
+ *   transfer: 'put' | 'get' | null,
+ *   thingName: string | null,
+ *   localPath?: string,
+ *   remotePath?: string,
+ *   command: string | undefined,
+ *   user: string | undefined,
+ *   region: string | undefined,
+ *   waitSec: number,
+ *   password: string | undefined,
+ *   privateKey: Buffer | undefined,
+ *   useAgent: boolean,
+ *   tryKeyboard: boolean,
+ *   forceTTY: boolean,
+ * }}
+ */
 function parseArgs(argv) {
   const args = argv.slice(2);
   const opts = {
     thingName: null,
+    transfer: null,
+    localPath: undefined,
+    remotePath: undefined,
     command: undefined,
     user: DEFAULT_USER,
     region: process.env.AWS_REGION,
@@ -130,6 +158,9 @@ function parseArgs(argv) {
   if (process.env.IOTSSH_USE_AGENT === '1') {
     opts.useAgent = true;
   }
+
+  /** @type {string[]} */
+  const positionals = [];
 
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
@@ -153,27 +184,50 @@ function parseArgs(argv) {
     } else if (a === '--wait') {
       opts.waitSec = Number(args[++i]);
     } else if (a === '--') {
-      opts.command = args.slice(i + 1).join(' ');
+      positionals.push(...args.slice(i + 1));
       break;
     } else if (!a.startsWith('-')) {
-      if (!opts.thingName) {
-        opts.thingName = a;
-      } else if (opts.command === undefined) {
-        opts.command = args.slice(i).join(' ');
-        break;
-      } else {
-        throw new Error(`Unexpected argument: ${a}`);
-      }
+      positionals.push(a);
     } else {
       throw new Error(`Unknown argument: ${a}`);
+    }
+  }
+
+  if (positionals[0] === 'put' || positionals[0] === 'get') {
+    opts.transfer = positionals[0];
+    opts.thingName = positionals[1] ?? null;
+    if (opts.transfer === 'put') {
+      opts.localPath = positionals[2];
+      opts.remotePath = positionals[3];
+    } else {
+      opts.remotePath = positionals[2];
+      opts.localPath = positionals[3];
+    }
+    if (positionals.length > 4) {
+      throw new Error(`Unexpected argument: ${positionals[4]}`);
+    }
+    if (opts.thingName && (!opts.localPath || !opts.remotePath)) {
+      throw new Error(
+        `Usage: iotssh ${opts.transfer} <THING_NAME> <${
+          opts.transfer === 'put' ? 'local> <remote' : 'remote> <local'
+        }>`,
+      );
+    }
+  } else {
+    opts.thingName = positionals[0] ?? null;
+    if (positionals.length > 1) {
+      opts.command = positionals.slice(1).join(' ');
     }
   }
 
   return opts;
 }
 
-/** @returns {'exec' | 'exec-tty' | 'shell-tty' | 'shell-pipe'} */
+/** @returns {'put' | 'get' | 'exec' | 'exec-tty' | 'shell-tty' | 'shell-pipe'} */
 function resolveSessionMode(opts) {
+  if (opts.transfer === 'put' || opts.transfer === 'get') {
+    return opts.transfer;
+  }
   if (opts.command) {
     return opts.forceTTY ? 'exec-tty' : 'exec';
   }
@@ -322,12 +376,74 @@ function runInteractiveShell(ssh) {
 
 /**
  * @param {import('ssh2').Client} ssh
+ * @returns {Promise<import('ssh2').SFTPWrapper>}
+ */
+function openSftp(ssh) {
+  return new Promise((resolve, reject) => {
+    ssh.sftp((err, sftp) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve(sftp);
+    });
+  });
+}
+
+/**
+ * @param {import('ssh2').Client} ssh
+ * @param {string} localPath
+ * @param {string} remotePath
+ * @returns {Promise<{ exitCode: number }>}
+ */
+async function runSftpPut(ssh, localPath, remotePath) {
+  const sftp = await openSftp(ssh);
+  await new Promise((resolve, reject) => {
+    sftp.fastPut(localPath, remotePath, (err) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve();
+    });
+  });
+  console.error(`Uploaded ${localPath} → ${remotePath}`);
+  return { exitCode: 0 };
+}
+
+/**
+ * @param {import('ssh2').Client} ssh
+ * @param {string} remotePath
+ * @param {string} localPath
+ * @returns {Promise<{ exitCode: number }>}
+ */
+async function runSftpGet(ssh, remotePath, localPath) {
+  const sftp = await openSftp(ssh);
+  await new Promise((resolve, reject) => {
+    sftp.fastGet(remotePath, localPath, (err) => {
+      if (err) {
+        reject(err);
+        return;
+      }
+      resolve();
+    });
+  });
+  console.error(`Downloaded ${remotePath} → ${localPath}`);
+  return { exitCode: 0 };
+}
+
+/**
+ * @param {import('ssh2').Client} ssh
  * @param {ReturnType<typeof parseArgs>} opts
  * @returns {Promise<{ exitCode: number }>}
  */
 async function runSshSession(ssh, opts) {
   const mode = resolveSessionMode(opts);
   switch (mode) {
+    case 'put':
+      return runSftpPut(ssh, opts.localPath, opts.remotePath);
+    case 'get':
+      return runSftpGet(ssh, opts.remotePath, opts.localPath);
     case 'exec':
       return runRemoteExec(ssh, opts.command, { pty: false });
     case 'exec-tty':
@@ -336,6 +452,22 @@ async function runSshSession(ssh, opts) {
       return runPipedShell(ssh);
   }
   return runInteractiveShell(ssh);
+}
+
+/**
+ * Fail fast before opening a tunnel when the local side is clearly wrong.
+ * @param {ReturnType<typeof parseArgs>} opts
+ */
+function validateTransferPaths(opts) {
+  if (opts.transfer === 'put') {
+    if (!fs.existsSync(opts.localPath)) {
+      throw new Error(`Local file not found: ${opts.localPath}`);
+    }
+    const st = fs.statSync(opts.localPath);
+    if (!st.isFile()) {
+      throw new Error(`Local path is not a file: ${opts.localPath}`);
+    }
+  }
 }
 
 async function main() {
@@ -351,6 +483,13 @@ async function main() {
   if (opts.help || !opts.thingName) {
     usage();
     process.exit(opts.help ? 0 : 2);
+  }
+
+  try {
+    validateTransferPaths(opts);
+  } catch (err) {
+    console.error(err.message);
+    process.exit(2);
   }
 
   const sessionMode = resolveSessionMode(opts);
@@ -378,6 +517,12 @@ async function main() {
       ssh.on('ready', async () => {
         if (sessionMode === 'shell-tty') {
           console.error('Connected. Press Ctrl+D or exit to close.\n');
+        } else if (sessionMode === 'put' || sessionMode === 'get') {
+          console.error(
+            sessionMode === 'put'
+              ? `Uploading ${opts.localPath} → ${opts.remotePath}…`
+              : `Downloading ${opts.remotePath} → ${opts.localPath}…`,
+          );
         }
         try {
           resolve(await runSshSession(ssh, opts));
