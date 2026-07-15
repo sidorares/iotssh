@@ -375,6 +375,37 @@ function runInteractiveShell(ssh) {
 }
 
 /**
+ * In-place transfer progress on stderr (same stream as other status messages).
+ * @param {string} label
+ */
+function createTransferProgress(label) {
+  let lastPercent = 0;
+  process.stderr.write(`${label} 0%`);
+
+  return {
+    step(totalTransferred, _chunk, total) {
+      const percent = total > 0
+        ? Math.min(100, Math.floor((totalTransferred / total) * 100))
+        : 100;
+      if (percent === lastPercent) {
+        return;
+      }
+      lastPercent = percent;
+      process.stderr.write(`\r${label} ${percent}%`);
+    },
+    finish() {
+      if (lastPercent < 100) {
+        process.stderr.write(`\r${label} 100%`);
+      }
+      process.stderr.write('\n');
+    },
+    clear() {
+      process.stderr.write('\n');
+    },
+  };
+}
+
+/**
  * @param {import('ssh2').Client} ssh
  * @returns {Promise<import('ssh2').SFTPWrapper>}
  */
@@ -397,17 +428,27 @@ function openSftp(ssh) {
  * @returns {Promise<{ exitCode: number }>}
  */
 async function runSftpPut(ssh, localPath, remotePath) {
+  const label = `Uploading ${localPath} → ${remotePath}`;
+  const progress = createTransferProgress(label);
   const sftp = await openSftp(ssh);
-  await new Promise((resolve, reject) => {
-    sftp.fastPut(localPath, remotePath, (err) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve();
+  try {
+    await new Promise((resolve, reject) => {
+      sftp.fastPut(localPath, remotePath, {
+        step: progress.step,
+      }, (err) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve();
+      });
     });
-  });
-  console.error(`Uploaded ${localPath} → ${remotePath}`);
+    progress.finish();
+    console.error(`Uploaded ${localPath} → ${remotePath}`);
+  } catch (err) {
+    progress.clear();
+    throw err;
+  }
   return { exitCode: 0 };
 }
 
@@ -418,17 +459,27 @@ async function runSftpPut(ssh, localPath, remotePath) {
  * @returns {Promise<{ exitCode: number }>}
  */
 async function runSftpGet(ssh, remotePath, localPath) {
+  const label = `Downloading ${remotePath} → ${localPath}`;
+  const progress = createTransferProgress(label);
   const sftp = await openSftp(ssh);
-  await new Promise((resolve, reject) => {
-    sftp.fastGet(remotePath, localPath, (err) => {
-      if (err) {
-        reject(err);
-        return;
-      }
-      resolve();
+  try {
+    await new Promise((resolve, reject) => {
+      sftp.fastGet(remotePath, localPath, {
+        step: progress.step,
+      }, (err) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve();
+      });
     });
-  });
-  console.error(`Downloaded ${remotePath} → ${localPath}`);
+    progress.finish();
+    console.error(`Downloaded ${remotePath} → ${localPath}`);
+  } catch (err) {
+    progress.clear();
+    throw err;
+  }
   return { exitCode: 0 };
 }
 
@@ -517,12 +568,6 @@ async function main() {
       ssh.on('ready', async () => {
         if (sessionMode === 'shell-tty') {
           console.error('Connected. Press Ctrl+D or exit to close.\n');
-        } else if (sessionMode === 'put' || sessionMode === 'get') {
-          console.error(
-            sessionMode === 'put'
-              ? `Uploading ${opts.localPath} → ${opts.remotePath}…`
-              : `Downloading ${opts.remotePath} → ${opts.localPath}…`,
-          );
         }
         try {
           resolve(await runSshSession(ssh, opts));
